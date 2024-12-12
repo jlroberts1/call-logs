@@ -1,113 +1,107 @@
 package com.contexts.calllog
 
+import android.content.pm.PackageManager
 import android.os.Bundle
-import android.provider.CallLog
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.recyclerview.widget.RecyclerView
-import okhttp3.mockwebserver.MockWebServer
+import androidx.core.view.isVisible
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.contexts.calllog.databinding.ActivityCallLogBinding
+import kotlinx.coroutines.launch
 
 class CallLogActivity : AppCompatActivity() {
 
-    private lateinit var recyclerView: RecyclerView
+    private val viewModel: CallLogViewModel by viewModels {
+        CallLogViewModel.factory((application as CallLogApplication).repository)
+    }
+    private lateinit var binding: ActivityCallLogBinding
     private lateinit var adapter: CallLogAdapter
-    private lateinit var mockWebServer: MockWebServer
+    private val requestPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            viewModel.fetchCallLogs()
+        } else {
+            showError("Need permissions to get call logs")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        setContentView(R.layout.activity_call_log)
+        binding = ActivityCallLogBinding.inflate(layoutInflater)
+        setContentView(binding.root)
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
             insets
         }
-        recyclerView = findViewById(R.id.recyclerView)
+
+        setupRecyclerView()
+        subscribeViewModel()
+        checkPermissionAndFetchLogs()
+    }
+
+    private fun setupRecyclerView() {
         adapter = CallLogAdapter()
-        recyclerView.adapter = adapter
-
-        fetchCallLogs()
+        binding.recyclerView.adapter = adapter
+        binding.recyclerView.hasFixedSize()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        mockWebServer.shutdown()
-    }
-
-    private fun fetchCallLogs() {
-        try {
-            ApiClient.startMockServer()
-
-
-            val callLogsFromPhone = getCallLogsFromPhone()
-
-            val apiCall = ApiClient.apiService.getCallLogs()
-            val response = apiCall.execute()
-
-            if (response.isSuccessful) {
-                val callLogsFromApi = response.body() ?: emptyList()
-                val combinedLogs = callLogsFromPhone + callLogsFromApi
-
-                adapter.submitList(combinedLogs)
-            } else {
-                // Handle failed response
-                showError("Failed to fetch call logs: ${response.message()}")
+    private fun checkPermissionAndFetchLogs() {
+        when {
+            isCallLogPermissionGranted() -> {
+                viewModel.fetchCallLogs()
             }
-        } catch (e: Exception) {
-            // Handle general network errors
-            showError("Error fetching call logs: ${e.message}")
-        }
-    }
-
-    private fun getCallLogsFromPhone(): List<CallLogEntry> {
-        val callLogs = mutableListOf<CallLogEntry>()
-
-        val cursor = contentResolver.query(
-            CallLog.Calls.CONTENT_URI,
-            arrayOf(
-                CallLog.Calls._ID,
-                CallLog.Calls.NUMBER,
-                CallLog.Calls.DATE,
-                CallLog.Calls.TYPE,
-            ),
-            null,
-            null,
-            "${CallLog.Calls.DATE} DESC"
-        )
-
-        Thread.sleep(3000)
-
-        cursor?.apply {
-            while (moveToNext()) {
-                val id = getString(getColumnIndex(CallLog.Calls._ID))
-                val number = getString(getColumnIndex(CallLog.Calls.NUMBER))
-                val date = getLong(getColumnIndex(CallLog.Calls.DATE))
-                val type = getInt(getColumnIndex(CallLog.Calls.TYPE))
-
-                callLogs.add(
-                    CallLogEntry(
-                        id.toInt(),
-                        number,
-                        date,
-                        getCallType(type)
-                    )
-                )
+            shouldShowRequestPermissionRationale(android.Manifest.permission.READ_CALL_LOG) -> {
+                showPermissionRationale()
             }
-            close()
+            else -> {
+                requestPermissionLauncher.launch(android.Manifest.permission.READ_CALL_LOG)
+            }
         }
-        return callLogs
     }
 
-    private fun getCallType(type: Int): String {
-        return when (type) {
-            CallLog.Calls.OUTGOING_TYPE -> "Outgoing"
-            CallLog.Calls.INCOMING_TYPE -> "Incoming"
-            CallLog.Calls.MISSED_TYPE -> "Missed"
-            else -> "Unknown"
+    private fun isCallLogPermissionGranted(): Boolean =
+        ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.READ_CALL_LOG
+        ) == PackageManager.PERMISSION_GRANTED
+
+    private fun subscribeViewModel() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.uiState.collect {
+                    updateUi(it)
+                }
+            }
         }
+    }
+
+    private fun updateUi(state: CallLogUiState) {
+        binding.progressBar.isVisible = state.isLoading
+        adapter.submitList(state.logs)
+        state.error?.let { showError(it) }
+    }
+
+    private fun showPermissionRationale() {
+        AlertDialog.Builder(this)
+            .setTitle("Permission Required")
+            .setMessage("Access to call logs is required to show your history. Would you like to grant this permission?")
+            .setPositiveButton("Grant") { _, _ ->
+                requestPermissionLauncher.launch(android.Manifest.permission.READ_CALL_LOG)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun showError(message: String) {
